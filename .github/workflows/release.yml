@@ -70,10 +70,12 @@ jobs:
         include:
           - runner: ubuntu-latest
             platform: linux/amd64
+            arch: amd64
           # arm64 用原生 runner 交叉编译，比 QEMU 模拟快一个数量级。
           # 免费 arm runner 仅公共仓库可用；私有仓库请把这一行删掉。
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -105,28 +107,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 每个架构先推一个带架构后缀的真实 tag。
+      # 不用 push-by-digest：GHCR 对"没有任何 tag 挂载"的 digest 不落成可引用
+      # 的 package，下一个 job 引用时直接 404 not found。
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
           provenance: false
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
           build-args: |
             VERSION_SHORT=${{ steps.ver.outputs.short }}
             VERSION_LONG=${{ steps.ver.outputs.long }}
             VERSION_GIT_HASH=${{ steps.ver.outputs.sha }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ strategy.job-index }}
-          path: /tmp/digests/*
 
   # ---------------------------------------------------- 合并多架构 manifest
   merge:
@@ -139,25 +134,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
       - name: Create manifest list
         run: |
           set -euo pipefail
-          args=()
-          for f in /tmp/digests/*; do
-            args+=("ghcr.io/${{ github.repository }}@sha256:$(basename "$f")")
-          done
-          [ "${#args[@]}" -gt 0 ] || { echo "no digest found" >&2; exit 1; }
+          V="${{ needs.prepare.outputs.version }}"
+          IMG="ghcr.io/${{ github.repository }}"
           docker buildx imagetools create \
-            -t "ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}" \
-            -t "ghcr.io/${{ github.repository }}:latest" \
-            "${args[@]}"
-          docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}"
+            -t "${IMG}:${V}" \
+            -t "${IMG}:latest" \
+            "${IMG}:${V}-amd64" \
+            "${IMG}:${V}-arm64"
+          docker buildx imagetools inspect "${IMG}:${V}"
 
   # --------------------------------- 仅在镜像发布成功后打 tag（天然幂等）
   tag:
