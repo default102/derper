@@ -83,9 +83,19 @@ jobs:
           ./scripts/fetch-upstream.sh "${{ needs.prepare.outputs.version }}"
           ./scripts/apply-patches.sh
 
-      - name: Read upstream commit
-        id: sha
-        run: echo "sha=$(sed -n 2p build_src/VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Compute version strings
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.version }}"
+          SHA="$(sed -n 2p build_src/VERSION)"
+          SHORT="${TAG#v}"
+          {
+            echo "short=${SHORT}"
+            echo "long=${SHORT}-t${SHA:0:9}"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -102,8 +112,9 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: false
           build-args: |
-            VERSION_LONG=${{ needs.prepare.outputs.version }}
-            VERSION_GIT_HASH=${{ steps.sha.outputs.sha }}
+            VERSION_SHORT=${{ steps.ver.outputs.short }}
+            VERSION_LONG=${{ steps.ver.outputs.long }}
+            VERSION_GIT_HASH=${{ steps.ver.outputs.sha }}
           outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true
 
       - name: Export digest

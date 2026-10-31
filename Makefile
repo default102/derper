@@ -17,12 +17,15 @@ src:
 ## 本地构建（与 CI 完全同一条路径）
 build: src
 	@set -euo pipefail; \
-	VERSION_LONG=$$(sed -n 1p build_src/VERSION); \
-	VERSION_GIT_HASH=$$(sed -n 2p build_src/VERSION); \
-	echo "building $$VERSION_LONG ($$VERSION_GIT_HASH) for $(PLATFORM)"; \
+	TAG=$$(sed -n 1p build_src/VERSION); \
+	SHA=$$(sed -n 2p build_src/VERSION); \
+	SHORT="$${TAG#v}"; \
+	LONG="$${SHORT}-t$${SHA:0:9}"; \
+	echo "building $$LONG ($$SHA) for $(PLATFORM)"; \
 	docker build --platform "$(PLATFORM)" \
-	  --build-arg VERSION_LONG="$$VERSION_LONG" \
-	  --build-arg VERSION_GIT_HASH="$$VERSION_GIT_HASH" \
+	  --build-arg VERSION_SHORT="$$SHORT" \
+	  --build-arg VERSION_LONG="$$LONG" \
+	  --build-arg VERSION_GIT_HASH="$$SHA" \
 	  -t "$(IMAGE):local" .
 
 ## 冒烟测试：起容器 + 自签证书 + HTTPS 探活

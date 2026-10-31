@@ -37,6 +37,7 @@ ENV GOPATH=/go
 # ---------------------------------------------------------------- 编译阶段
 FROM ${GO_BUILDER_IMAGE} AS builder
 ARG TARGETARCH
+ARG VERSION_SHORT=""
 ARG VERSION_LONG=""
 ARG VERSION_GIT_HASH=""
 WORKDIR /src
@@ -45,21 +46,21 @@ COPY build_src/tailscale/ /src/
 # 先只拉依赖，利用 Docker 层缓存：改补丁不会重下依赖
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
-# 注意：VERSION_LONG/SHORT/GIT_HASH 来自 source .envrc，不是 Dockerfile 的 ARG/ENV。
-# 必须写成 $${...} —— 单个 $ 会被 Docker 在启动 shell 之前就替换成空字符串
-# （原项目正是这样，导致 -X 实际注入了空值，derper --version 一直是默认值）。
+# 版本信息直接用 -ldflags 注入，不调用 cmd/mkversion：
+#   - mkversion 对 TS_VERSION_LONG 有严格形状校验
+#     （^major.minor.patch(-N)?-t<9位hash>$），传 tag 原样值会直接 log.Fatal；
+#   - 它还依赖 .envrc 里的 TS_VERSION_* 拼装，多一层出错面。
+# 传入的 ${...} 都是 ARG，由 Docker 替换，值可靠（原项目的 $VAR 写法会在
+# 进入 shell 前被替换成空串，导致版本号一直是默认值）。
 RUN set -eux; \
-    export TS_VERSION_LONG="${VERSION_LONG}" TS_VERSION_GIT_HASH="${VERSION_GIT_HASH}"; \
-    go run ./cmd/mkversion --export > /tmp/envrc; \
-    . /tmp/envrc; \
     CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" \
       go build -trimpath -o /out/derper \
       -ldflags "-s -w \
-        -X tailscale.com/version.longStamp=$${VERSION_LONG} \
-        -X tailscale.com/version.shortStamp=$${VERSION_SHORT} \
-        -X tailscale.com/version.gitCommitStamp=$${VERSION_GIT_HASH}" \
+        -X tailscale.com/version.longStamp=${VERSION_LONG} \
+        -X tailscale.com/version.shortStamp=${VERSION_SHORT} \
+        -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH}" \
       ./cmd/derper; \
-    /out/derper --version
+    go version -m /out/derper
 
 # ---------------------------------------------------------------- 运行阶段
 FROM alpine:3.22
