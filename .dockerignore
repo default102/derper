@@ -1,0 +1,8 @@
+.git
+.github
+.gitignore
+README.md
+LICENSE
+Makefile
+scripts
+build_src/*.tar.gz

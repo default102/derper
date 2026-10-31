@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要构建的上游 tag（留空 = 最新正式版）"
+        required: false
+      force:
+        description: "即使已发布过也重新构建"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+# 关键：不要 cancel-in-progress。构建被打断会产生"tag 已建、镜像未发"的半截状态，
+# 而旧流程正是靠 tag 推断发布状态，一旦半截就永久卡死。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------ 版本判定
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_build: ${{ steps.v.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+            UPSTREAM="${{ inputs.version }}"
+          else
+            UPSTREAM="$(./scripts/upstream-version.sh)"
+          fi
+          # 已发布版本取自"远端 tag 列表"，而不是 git describe。
+          # git describe 在同一 commit 上挂多个 tag 时只返回其中一个，
+          # 会误判为新版本 -> 重复创建已有 tag -> fatal: tag already exists。
+          PUBLISHED="$(git ls-remote --tags --refs origin \
+            | awk '{print $2}' | sed 's|refs/tags/||' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          echo "upstream=${UPSTREAM} published=${PUBLISHED:-none}"
+          echo "version=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          if [ "${UPSTREAM}" = "${PUBLISHED}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ------------------------------------------------------------- 分平台构建
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          # arm64 用原生 runner 交叉编译，比 QEMU 模拟快一个数量级。
+          # 免费 arm runner 仅公共仓库可用；私有仓库请把这一行删掉。
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream source and patch
+        run: |
+          set -euo pipefail
+          ./scripts/fetch-upstream.sh "${{ needs.prepare.outputs.version }}"
+          ./scripts/apply-patches.sh
+
+      - name: Read upstream commit
+        id: sha
+        run: echo "sha=$(sed -n 2p build_src/VERSION)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: |
+            VERSION_LONG=${{ needs.prepare.outputs.version }}
+            VERSION_GIT_HASH=${{ steps.sha.outputs.sha }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+
+  # ---------------------------------------------------- 合并多架构 manifest
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create manifest list
+        run: |
+          set -euo pipefail
+          args=()
+          for f in /tmp/digests/*; do
+            args+=("ghcr.io/${{ github.repository }}@sha256:$(basename "$f")")
+          done
+          [ "${#args[@]}" -gt 0 ] || { echo "no digest found" >&2; exit 1; }
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}" \
+            -t "ghcr.io/${{ github.repository }}:latest" \
+            "${args[@]}"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}"
+
+  # --------------------------------- 仅在镜像发布成功后打 tag（天然幂等）
+  tag:
+    needs: [prepare, merge]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create tag
+        run: |
+          set -euo pipefail
+          V="${{ needs.prepare.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/${V}" >/dev/null 2>&1; then
+            echo "tag ${V} already exists, skip"
+          else
+            git tag "${V}"
+            git push origin "refs/tags/${V}"
+          fi
+
+  # -------------------------------------------------------------- 失败报警
+  notify:
+    needs: [prepare, build, merge, tag]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ needs.prepare.outputs.version }}' || 'unknown';
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const title = `derper 构建失败：${version}`;
+            const body = [
+              `上游版本 \`${version}\` 构建失败。`,
+              ``,
+              `Run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'ci-failure',
+            });
+            const existing = issues.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number, body: `再次失败：\n\n${body}`,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: ['ci-failure'] });
+            }
